@@ -1,0 +1,13 @@
+node_modules/
+data/
+.env
+*.log
+首次登录.txt
+**/bin/
+**/obj/
+.vs/
+artifacts/
+TestResults/
+**/App_Data/
+**/appsettings.Local.json
+*.pubxml.user
