@@ -4,8 +4,8 @@ using ReportPlatform.Models;
 
 namespace ReportPlatform.Services;
 
-public sealed record PreparedQuery(string Text, IReadOnlyDictionary<string, string> Parameters,
-    string? SchemaSql = null, string? OrgColumn = null, IReadOnlyList<string>? Fields = null);
+public sealed record PreparedQuery(string DataSql, string CountSql, string OrderBySql,
+    IReadOnlyDictionary<string, string> Parameters, string SchemaSql, string OrgColumn, IReadOnlyList<string> Fields);
 
 public static partial class SqlQueryBuilder
 {
@@ -26,14 +26,19 @@ public static partial class SqlQueryBuilder
         if (string.IsNullOrWhiteSpace(sql) || sql.Length > 100_000 || !SelectPattern().IsMatch(sql) || ForbiddenPattern().IsMatch(sql))
             throw new ApiException("仅允许单条 SELECT，不允许注释、分号或写入操作");
     }
-    public static PreparedQuery Build(Report report, string orgId, IReadOnlyList<Filter>? filters, int limit)
+    public static PreparedQuery Build(Report report, string orgId, IReadOnlyList<Filter>? filters)
     {
         Validate(report.Sql);
         if (report.Fields.Count == 0) throw new ApiException("请配置报表字段");
         filters ??= [];
         if (filters.Count > 50) throw new ApiException("筛选条件最多 50 个");
-        var parameters = new Dictionary<string, string> { ["org"] = orgId };
-        var where = new List<string> { $"q.{Identifier(report.OrgColumn)} = @org" };
+        var parameters = new Dictionary<string, string>();
+        var where = new List<string>();
+        if (!string.IsNullOrWhiteSpace(report.OrgColumn))
+        {
+            where.Add($"q.{Identifier(report.OrgColumn)} = @org");
+            parameters["org"] = orgId;
+        }
         var operators = new Dictionary<string, string> { ["eq"] = "=", ["ne"] = "<>", ["gt"] = ">", ["gte"] = ">=", ["lt"] = "<", ["lte"] = "<=" };
         for (var i = 0; i < filters.Count; i++)
         {
@@ -56,7 +61,9 @@ public static partial class SqlQueryBuilder
             }
         }
         var fields = string.Join(",", report.Fields.Select(f => $"q.{Identifier(f.Key)}"));
-        return new($"SELECT TOP ({Math.Clamp(limit, 1, 10001)}) {fields} FROM ({report.Sql}) AS q WHERE {string.Join(" AND ", where)}", parameters,
-            $"SELECT TOP (0) * FROM ({report.Sql}) AS q", report.OrgColumn, report.Fields.Select(f => f.Key).ToArray());
+        var orderBy = string.Join(",", report.Fields.Select(f => $"q.{Identifier(f.Key)}"));
+        var fromAndWhere = $"FROM ({report.Sql}) AS q{(where.Count > 0 ? " WHERE " + string.Join(" AND ", where) : "")}";
+        return new($"SELECT {fields} {fromAndWhere}", $"SELECT COUNT_BIG(1) {fromAndWhere}", orderBy,
+            parameters, $"SELECT TOP (0) * FROM ({report.Sql}) AS q", report.OrgColumn, report.Fields.Select(f => f.Key).ToArray());
     }
 }

@@ -46,8 +46,10 @@ public sealed class ConfigurationService(PlatformStore store, AccessService acce
                     break;
                 case Report report:
                     SqlQueryBuilder.Validate(report.Sql);
-                    if (string.IsNullOrWhiteSpace(report.OrgColumn)) throw new ApiException("请填写组织 ID 字段，它必须是 SQL 返回的列名或别名，例如 OrgId 或 组织ID。");
-                    SqlQueryBuilder.Identifier(report.OrgColumn);
+                    report.OrgColumn = report.OrgColumn?.Trim() ?? "";
+                    if (report.OrgColumn != "") SqlQueryBuilder.Identifier(report.OrgColumn);
+                    if (old is Report oldReport && !body.TryGetProperty("icon", out _)) report.Icon = oldReport.Icon;
+                    ReportIconRules.Validate(report.Icon);
                     if (store.Find<DataSource>(report.ConnectionId) is null) throw new ApiException("请选择数据源");
                     if (report.Fields is null || report.Fields.Count is < 1 or > 100) throw new ApiException("请配置 1–100 个字段");
                     var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -60,6 +62,13 @@ public sealed class ConfigurationService(PlatformStore store, AccessService acce
                         if (string.IsNullOrWhiteSpace(field.Label)) throw new ApiException($"请填写第 {index + 1} 行字段“{field.Key}”的显示名称。");
                     }
                     // An editor can maintain an assigned report but cannot redirect it into a different database.
+                    // Older clients that omit template properties must not erase saved presets.
+                    if (old is Report previousReport)
+                    {
+                        if (!body.TryGetProperty("filterTemplates", out _)) report.FilterTemplates = previousReport.FilterTemplates;
+                        if (!body.TryGetProperty("defaultFilterTemplateId", out _)) report.DefaultFilterTemplateId = previousReport.DefaultFilterTemplateId;
+                    }
+                    FilterTemplateRules.ValidatePresets(report);
                     if (!access.IsAdmin(currentUser) && old is Report prior && report.ConnectionId != prior.ConnectionId)
                         throw new ApiException("只有管理员可以更换数据源", 403);
                     break;
@@ -84,7 +93,10 @@ public sealed class ConfigurationService(PlatformStore store, AccessService acce
             store.Delete(kind, id);
             if (entity is User) store.RevokeUser(id);
             if (entity is Report)
+            {
+                store.Execute("DELETE FROM report_filter_templates WHERE reportId=@id", ("@id", id));
                 foreach (var role in store.All<Role>().Where(r => r.Permissions.Remove(id))) store.Save(role);
+            }
         }
     }
 }

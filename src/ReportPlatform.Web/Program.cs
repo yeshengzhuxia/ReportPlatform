@@ -37,7 +37,7 @@ app.Use(async (context, next) =>
     context.Response.Headers["X-Content-Type-Options"] = "nosniff";
     context.Response.Headers["X-Frame-Options"] = "DENY";
     context.Response.Headers["Referrer-Policy"] = "same-origin";
-    context.Response.Headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'";
+    context.Response.Headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'";
     try
     {
         if (context.Request.Path.StartsWithSegments("/api"))
@@ -58,6 +58,20 @@ app.Use(async (context, next) =>
         context.Response.StatusCode = status;
         await context.Response.WriteAsJsonAsync(new { error = message });
     }
+});
+// A service restart invalidates old browser cookies. Return the normal 401 response before
+// controller code is reached, so the UI can show the login page without a debugger break.
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/api") &&
+        !context.Request.Path.Equals("/api/login", StringComparison.OrdinalIgnoreCase) &&
+        app.Services.GetRequiredService<AccessService>().GetLogin(context) is null)
+    {
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        await context.Response.WriteAsJsonAsync(new { error = "请重新登录" });
+        return;
+    }
+    await next();
 });
 app.UseDefaultFiles();
 app.UseStaticFiles();

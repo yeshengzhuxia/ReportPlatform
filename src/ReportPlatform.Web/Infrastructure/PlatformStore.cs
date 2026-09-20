@@ -35,6 +35,11 @@ public sealed class PlatformStore
             CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT,accountId TEXT,expires INTEGER);
             CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,at TEXT,userId TEXT,username TEXT,accountId TEXT,reportId TEXT,reportName TEXT,action TEXT,success INTEGER,rows INTEGER,duration INTEGER,detail TEXT);
             CREATE INDEX IF NOT EXISTS ix_audit_at ON audit(at);
+            CREATE TABLE IF NOT EXISTS report_filter_templates(
+                id TEXT PRIMARY KEY,reportId TEXT NOT NULL,userId TEXT NOT NULL,accountId TEXT NOT NULL,
+                name TEXT NOT NULL,filters TEXT NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS ix_filter_template_owner_name
+                ON report_filter_templates(reportId,userId,accountId,name COLLATE NOCASE);
             """);
     }
     private SqliteConnection Open() { var connection = new SqliteConnection(connectionString); connection.Open(); return connection; }

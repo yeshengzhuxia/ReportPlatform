@@ -12,16 +12,17 @@ public sealed class AccessService(PlatformStore store, PlatformSettings settings
     public bool Allowed(User user, string reportId, string action) => IsAdmin(user) || user.RoleIds
         .Select(store.Find<Role>).Any(role => role?.Permissions.TryGetValue(reportId, out var actions) == true && actions.Contains(action));
     public void RequireAdmin(User user) { if (!IsAdmin(user)) throw new ApiException("没有管理权限", 403); }
-    public LoginContext RequireLogin(HttpContext context)
+    public LoginContext? GetLogin(HttpContext context)
     {
         var token = context.Request.Cookies["session"] ?? "";
         var session = store.FindSession(token);
         var user = session is null ? null : store.Find<User>(session.UserId);
         var account = session is null ? null : store.Find<Account>(session.AccountId);
         if (user?.Enabled != true || account?.Enabled != true || !user.AccountIds.Contains(account.Id))
-            throw new ApiException("请重新登录", 401);
+            return null;
         return new(user, account, token);
     }
+    public LoginContext RequireLogin(HttpContext context) => GetLogin(context) ?? throw new ApiException("请重新登录", 401);
     public object Login(HttpContext context, LoginRequest request)
     {
         // Serializing this short section ensures concurrent requests cannot bypass the failure counter.

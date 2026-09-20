@@ -17,8 +17,8 @@ public sealed class CredentialService
     }
     public static string HashPassword(string password)
     {
-        if (string.IsNullOrEmpty(password) || password.Length < 12 || password.Length > 256)
-            throw new ApiException("密码长度应为 12–256 位");
+        if (string.IsNullOrEmpty(password) || password.Length < 5 || password.Length > 256)
+            throw new ApiException("密码长度应为 5–256 位");
         var salt = RandomNumberGenerator.GetBytes(16);
         var hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, 210_000, HashAlgorithmName.SHA512, 64);
         return $"pbkdf2:210000:{Convert.ToHexString(salt)}:{Convert.ToHexString(hash)}";

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
@@ -15,7 +16,13 @@ public sealed class PlatformController(PlatformStore store, AccessService access
     IReportExecutor executor, ILogger<PlatformController> logger) : ControllerBase
 {
     [HttpPost("login")]
-    public object Login(LoginRequest request) => access.Login(HttpContext, request);
+    public IActionResult Login(LoginRequest request)
+    {
+        // Invalid credentials are an expected HTTP result. Handling them here also keeps
+        // Visual Studio from reporting a user-unhandled exception during normal sign-in.
+        try { return Ok(access.Login(HttpContext, request)); }
+        catch (ApiException ex) { return StatusCode(ex.Status, new { error = ex.Message }); }
+    }
 
     [HttpPost("logout")]
     public object Logout()
@@ -23,6 +30,25 @@ public sealed class PlatformController(PlatformStore store, AccessService access
         var login = access.RequireLogin(HttpContext); store.RevokeSession(login.Token);
         Response.Cookies.Delete("session", new CookieOptions { Path = "/", HttpOnly = true, SameSite = SameSiteMode.Strict });
         return new { ok = true };
+    }
+
+    [HttpPost("password")]
+    public IActionResult ChangePassword(ChangePasswordRequest request)
+    {
+        var login = access.GetLogin(HttpContext);
+        if (login is null) return Unauthorized(new { error = "请重新登录" });
+        if (!CredentialService.VerifyPassword(request.CurrentPassword, login.User.Password))
+            return BadRequest(new { error = "当前密码不正确" });
+        try
+        {
+            login.User.Password = CredentialService.HashPassword(request.NewPassword);
+            store.Save(login.User);
+            store.RevokeUser(login.User.Id);
+            Response.Cookies.Delete("session", new CookieOptions { Path = "/", HttpOnly = true, SameSite = SameSiteMode.Strict });
+            store.Audit(login.User, login.Account, null, "change-password", true);
+            return Ok(new { ok = true });
+        }
+        catch (ApiException ex) { return BadRequest(new { error = ex.Message }); }
     }
     [HttpGet("bootstrap")]
     public object Bootstrap()
@@ -33,7 +59,7 @@ public sealed class PlatformController(PlatformStore store, AccessService access
             user = PlatformStore.Public(login.User), account = login.Account, admin = access.IsAdmin(login.User),
             reports = store.All<Report>().Where(r => r.Enabled && access.Allowed(login.User, r.Id, "view")).Select(r => new
             {
-                r.Id, r.Name, r.Description, r.Category, r.Fields,
+                r.Id, r.Name, r.Description, r.Category, r.Icon, r.Fields, r.ShowInMenu, r.FilterTemplates, r.DefaultFilterTemplateId,
                 actions = new[] { "view", "query", "export", "edit" }.Where(a => access.Allowed(login.User, r.Id, a))
             })
         };
@@ -91,6 +117,28 @@ public sealed class PlatformController(PlatformStore store, AccessService access
             throw new ApiException("连接失败，请检查地址、账号和证书配置");
         }
     }
+
+    [HttpPost("admin/reports/preview-fields")]
+    public async Task<IActionResult> PreviewReportFields(ReportFieldsPreviewRequest request, CancellationToken cancellationToken)
+    {
+        var login = access.GetLogin(HttpContext);
+        if (login is null) return Unauthorized(new { error = "请重新登录" });
+        if (!access.IsAdmin(login.User)) return StatusCode(403, new { error = "没有管理权限" });
+        try
+        {
+            SqlQueryBuilder.Validate(request.Sql);
+            var source = store.Find<DataSource>(request.ConnectionId) ?? throw new ApiException("请选择有效的数据源");
+            var fields = await executor.PreviewFieldsAsync(source, request.Sql, cancellationToken);
+            if (fields.Count == 0) return BadRequest(new { error = "SQL 没有返回字段，请检查 SELECT 语句。" });
+            return Ok(new { fields });
+        }
+        catch (SqlException ex)
+        {
+            logger.LogWarning("Field preview failed: {Number}", ex.Number);
+            return BadRequest(new { error = SqlFailureMessages.ForNumber(ex.Number) });
+        }
+        catch (ApiException ex) { return BadRequest(new { error = ex.Message }); }
+    }
     [HttpPost("reports/{id}/query")]
     public Task<IActionResult> QueryReport(string id, QueryRequest request, CancellationToken cancellationToken) => Run(id, "query", request, cancellationToken);
     [HttpPost("reports/{id}/export")]
@@ -103,17 +151,32 @@ public sealed class PlatformController(PlatformStore store, AccessService access
         var stopwatch = Stopwatch.StartNew();
         try
         {
-            var limit = action == "export" ? 10000 : 500;
-            var query = SqlQueryBuilder.Build(report, login.Account.OrgId, request.Filters, limit + 1);
+            var query = SqlQueryBuilder.Build(report, login.Account.OrgId, request.Filters);
             var source = store.Find<DataSource>(report.ConnectionId) ?? throw new ApiException("数据源不存在");
-            var records = await executor.QueryAsync(source, query, cancellationToken);
-            var truncated = records.Count > limit;
-            if (action == "export" && truncated) throw new ApiException("导出超过 10000 行，请缩小筛选范围");
-            var rows = records.Take(limit).ToList();
-            store.Audit(login.User, login.Account, report, action, true, rows.Count, stopwatch.ElapsedMilliseconds);
-            if (action == "query") return Ok(new { rows, truncated, limit, duration = stopwatch.ElapsedMilliseconds });
+            if (action == "query")
+            {
+                var page = Math.Max(1, request.Page);
+                var pageSize = Math.Clamp(request.PageSize, 10, 1000);
+                var result = await executor.QueryPageAsync(source, query, page, pageSize, cancellationToken);
+                store.Audit(login.User, login.Account, report, action, true, result.Rows.Count, stopwatch.ElapsedMilliseconds);
+                return Ok(new { rows = result.Rows, total = result.Total, page, pageSize, duration = stopwatch.ElapsedMilliseconds });
+            }
+
             var filename = string.Concat(report.Name.Select(c => char.IsControl(c) || "/\\:*?\"<>|".Contains(c) ? '_' : c));
-            return File(CsvExport.Create(report, rows), "text/csv; charset=utf-8", filename + ".csv");
+            Response.ContentType = "text/csv; charset=utf-8";
+            Response.Headers["Content-Disposition"] = "attachment; filename*=UTF-8''" + Uri.EscapeDataString(filename + ".csv");
+            await using var writer = new StreamWriter(Response.Body, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true), 65536, leaveOpen: true);
+            await writer.WriteLineAsync(CsvExport.Header(report));
+            var count = 0;
+            await foreach (var row in executor.StreamAsync(source, query, cancellationToken))
+            {
+                await writer.WriteLineAsync(CsvExport.Row(report, row));
+                count++;
+                if (count % 500 == 0) await writer.FlushAsync(cancellationToken);
+            }
+            await writer.FlushAsync(cancellationToken);
+            store.Audit(login.User, login.Account, report, action, true, count, stopwatch.ElapsedMilliseconds);
+            return new EmptyResult();
         }
         catch (Exception ex)
         {
@@ -126,7 +189,7 @@ public sealed class PlatformController(PlatformStore store, AccessService access
             };
             store.Audit(login.User, login.Account, report, action, false, duration: stopwatch.ElapsedMilliseconds,
                 detail: message);
-            if (ex is OperationCanceledException) throw;
+            if (Response.HasStarted || ex is OperationCanceledException) return new EmptyResult();
             logger.LogWarning("Report {Id} failed: {Type}; {Message}", id, ex.GetType().Name, message);
             return StatusCode(ex is ApiException api ? api.Status : 400, new { error = message });
         }

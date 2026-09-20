@@ -12,7 +12,7 @@ public sealed class SecurityTests
     [Fact]
     public void QueryReportsMissingOrganizationAndDisplayColumnsClearly()
     {
-        var query = new PreparedQuery("", new Dictionary<string, string>(), "", "1", ["Mocode"]);
+        var query = new PreparedQuery("", "", "", new Dictionary<string, string>(), "", "1", ["Mocode"]);
         var missingOrg = Assert.Throws<ApiException>(() => ReportColumns.Validate(query, ["MoCode", "TenantId"]));
         Assert.Contains("组织 ID 字段“1”", missingOrg.Message);
         Assert.Contains("不是账套组织 ID 值", missingOrg.Message);
@@ -26,21 +26,30 @@ public sealed class SecurityTests
     public void ChineseFieldNamesAndClosingBracketsAreSafelyQuoted()
     {
         var report = new Report { Sql = "SELECT OrgId AS [组织ID], Amount AS [销售 金额] FROM Orders", OrgColumn = "组织ID", Fields = [new("销售 金额", "金额")] };
-        var query = SqlQueryBuilder.Build(report, "200", [new("销售 金额", "gte", JsonSerializer.SerializeToElement(100))], 500);
-        Assert.Contains("q.[组织ID] = @org", query.Text);
-        Assert.Contains("q.[销售 金额] >= @p0", query.Text);
+        var query = SqlQueryBuilder.Build(report, "200", [new("销售 金额", "gte", JsonSerializer.SerializeToElement(100))]);
+        Assert.Contains("q.[组织ID] = @org", query.DataSql);
+        Assert.Contains("q.[销售 金额] >= @p0", query.DataSql);
         Assert.Equal("[a]]; DROP TABLE T;--]", SqlQueryBuilder.Identifier("a]; DROP TABLE T;--"));
         Assert.Throws<ApiException>(() => SqlQueryBuilder.Identifier(" "));
         Assert.Throws<ApiException>(() => SqlQueryBuilder.Identifier("name\n"));
         Assert.Throws<ApiException>(() => SqlQueryBuilder.Identifier(new string('a', 129)));
     }
     [Fact]
+    public void FieldPreviewUsesAsAliasesAsDisplayNames()
+    {
+        var fields = SqlAliases.ToFields("SELECT TenantId, MoCode AS [工单编号], Qty AS \"数量\" FROM IcsMo",
+            ["TenantId", "工单编号", "数量"]);
+        Assert.Equal("", fields[0].Label);
+        Assert.Equal("工单编号", fields[1].Label);
+        Assert.Equal("数量", fields[2].Label);
+    }
+    [Fact]
     public void PasswordHashesVerifyAndRejectInvalidPasswords()
     {
-        var hash = CredentialService.HashPassword("Password123456!");
-        Assert.True(CredentialService.VerifyPassword("Password123456!", hash));
+        var hash = CredentialService.HashPassword("abc12");
+        Assert.True(CredentialService.VerifyPassword("abc12", hash));
         Assert.False(CredentialService.VerifyPassword("WrongPassword!", hash));
-        Assert.Throws<ApiException>(() => CredentialService.HashPassword("short"));
+        Assert.Throws<ApiException>(() => CredentialService.HashPassword("1234"));
     }
     [Fact]
     public void LegacyScryptPasswordRemainsUsable()
@@ -73,12 +82,21 @@ public sealed class SecurityTests
     public void OrganizationAndFilterValuesCannotBecomeSql()
     {
         var report = new Report { Sql = "SELECT OrgId, Amount FROM Orders", OrgColumn = "OrgId", Fields = [new("Amount", "金额")] };
-        var query = SqlQueryBuilder.Build(report, "1' OR 1=1", [new("Amount", "eq", JsonSerializer.SerializeToElement("0' OR 1=1"))], 999999);
-        Assert.Contains("TOP (10001)", query.Text);
-        Assert.Contains("[OrgId] = @org", query.Text);
-        Assert.DoesNotContain("OR 1=1", query.Text);
+        var query = SqlQueryBuilder.Build(report, "1' OR 1=1", [new("Amount", "eq", JsonSerializer.SerializeToElement("0' OR 1=1"))]);
+        Assert.Contains("[OrgId] = @org", query.DataSql);
+        Assert.DoesNotContain("OR 1=1", query.DataSql);
         Assert.Equal("1' OR 1=1", query.Parameters["org"]);
-        Assert.Throws<ApiException>(() => SqlQueryBuilder.Build(report, "1", [new("Other", "eq", JsonSerializer.SerializeToElement(1))], 500));
+        Assert.Throws<ApiException>(() => SqlQueryBuilder.Build(report, "1", [new("Other", "eq", JsonSerializer.SerializeToElement(1))]));
+    }
+    [Fact]
+    public void EmptyOrganizationColumnQueriesAllOrganizations()
+    {
+        var report = new Report { Sql = "SELECT TenantId, Amount FROM Orders", OrgColumn = "", Fields = [new("Amount", "金额")] };
+        var query = SqlQueryBuilder.Build(report, "200", []);
+        Assert.Empty(query.Parameters);
+        Assert.DoesNotContain("@org", query.DataSql);
+        Assert.DoesNotContain(" WHERE ", query.DataSql);
+        ReportColumns.Validate(query, ["TenantId", "Amount"]);
     }
     [Fact]
     public void CsvNeutralizesSpreadsheetFormulas()

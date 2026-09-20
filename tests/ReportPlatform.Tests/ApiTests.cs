@@ -20,12 +20,27 @@ public sealed class TestExecutor : IReportExecutor
     public bool Fail { get; set; }
     public int Count { get; set; } = 1;
     public Task TestAsync(DataSource source, CancellationToken cancellationToken) => Task.CompletedTask;
-    public Task<List<Dictionary<string, object?>>> QueryAsync(DataSource source, PreparedQuery query, CancellationToken cancellationToken)
+    public Task<PagedQueryResult> QueryPageAsync(DataSource source, PreparedQuery query, int page, int pageSize, CancellationToken cancellationToken)
     {
         LastQuery = query;
         if (Fail) throw new InvalidOperationException("Simulated database failure");
-        return Task.FromResult(Enumerable.Range(0, Count).Select(i => new Dictionary<string, object?> { ["Amount"] = i + 100 }).ToList());
+        var rows = Enumerable.Range(0, Count).Skip((page - 1) * pageSize).Take(pageSize)
+            .Select(i => new Dictionary<string, object?> { ["Amount"] = i + 100 }).ToArray();
+        return Task.FromResult(new PagedQueryResult(rows, Count));
     }
+    public async IAsyncEnumerable<Dictionary<string, object?>> StreamAsync(DataSource source, PreparedQuery query, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        LastQuery = query;
+        if (Fail) throw new InvalidOperationException("Simulated database failure");
+        foreach (var i in Enumerable.Range(0, Count))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return new Dictionary<string, object?> { ["Amount"] = i + 100 };
+            await Task.Yield();
+        }
+    }
+    public Task<IReadOnlyList<ReportField>> PreviewFieldsAsync(DataSource source, string sql, CancellationToken cancellationToken) =>
+        Task.FromResult<IReadOnlyList<ReportField>>([new("OrgId", ""), new("Amount", "金额")]);
 }
 public sealed class PlatformFactory : WebApplicationFactory<Program>
 {
@@ -50,6 +65,68 @@ public sealed class PlatformFactory : WebApplicationFactory<Program>
 public sealed class ApiTests
 {
     [Fact]
+    public async Task ReportMenuSettingsPersistAndRespectViewAndButtonPermissions()
+    {
+        using var factory = new PlatformFactory(); using var admin = Client(factory); await Login(admin);
+        var store = factory.Services.GetRequiredService<PlatformStore>();
+        store.Save(new DataSource { Id = "menu-source", Name = "Test" });
+        const string icon = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        async Task<JsonObject> CreateReport(string name, bool showInMenu, bool enabled = true, string reportIcon = "") =>
+            await Json(await admin.PostAsJsonAsync("/api/admin/reports", new
+            {
+                name, showInMenu, enabled, icon = reportIcon, category = "生产管理", connectionId = "menu-source",
+                sql = "SELECT OrgId, Amount FROM Orders", orgColumn = "OrgId", fields = new[] { new { key = "Amount", label = "金额" } }
+            }));
+        var featured = await CreateReport("可查看的菜单报表", true, reportIcon: icon);
+        var hidden = await CreateReport("无查看权限的菜单报表", true);
+        var disabled = await CreateReport("停用的菜单报表", true, false);
+        var center = await CreateReport("仅报表中心显示", false);
+        var featuredId = featured["id"]!.GetValue<string>();
+        var hiddenId = hidden["id"]!.GetValue<string>();
+        var centerId = center["id"]!.GetValue<string>();
+        Assert.True((await Json(await admin.GetAsync("/api/admin/reports/" + featuredId)))["showInMenu"]!.GetValue<bool>());
+        var role = await Json(await admin.PostAsJsonAsync("/api/admin/roles", new
+        {
+            name = "菜单查看员", permissions = new Dictionary<string, string[]>
+            {
+                [featuredId] = ["view"], [centerId] = ["view"], [hiddenId] = ["query"],
+                [disabled["id"]!.GetValue<string>()] = ["view"]
+            }
+        }));
+        await Json(await admin.PostAsJsonAsync("/api/admin/users", new
+        {
+            name = "菜单查看员", username = "menu_reader", password = "MenuReader123!",
+            roleIds = new[] { role["id"]!.GetValue<string>() }, accountIds = new[] { "default" }, enabled = true
+        }));
+        using var reader = Client(factory); await Login(reader, "menu_reader", "MenuReader123!");
+        var reports = (await Json(await reader.GetAsync("/api/bootstrap")))["reports"]!.AsArray();
+        Assert.Equal(2, reports.Count);
+        var menu = Assert.Single(reports.Where(r => r!["showInMenu"]!.GetValue<bool>()))!;
+        Assert.Equal(featuredId, menu["id"]!.GetValue<string>());
+        Assert.Equal("生产管理", menu["category"]!.GetValue<string>());
+        Assert.Equal(icon, menu["icon"]!.GetValue<string>());
+        Assert.Equal("view", Assert.Single(menu["actions"]!.AsArray())!.GetValue<string>());
+        Assert.Equal(HttpStatusCode.Forbidden, (await reader.PostAsJsonAsync($"/api/reports/{featuredId}/query", new { })).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await reader.PostAsJsonAsync($"/api/reports/{featuredId}/export", new { })).StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, (await reader.PostAsJsonAsync($"/api/reports/{hiddenId}/query", new { })).StatusCode);
+        featured["category"] = "财务管理";
+        featured["showInMenu"] = false;
+        await Json(await admin.PutAsJsonAsync("/api/admin/reports/" + featuredId, featured));
+        reports = (await Json(await reader.GetAsync("/api/bootstrap")))["reports"]!.AsArray();
+        Assert.Empty(reports.Where(r => r!["showInMenu"]!.GetValue<bool>()));
+        Assert.Equal("财务管理", reports.Single(r => r!["id"]!.GetValue<string>() == featuredId)!["category"]!.GetValue<string>());
+        featured["enabled"] = false;
+        await Json(await admin.PutAsJsonAsync("/api/admin/reports/" + featuredId, featured));
+        Assert.Single((await Json(await reader.GetAsync("/api/bootstrap")))["reports"]!.AsArray());
+        var invalidIcon = await admin.PostAsJsonAsync("/api/admin/reports", new
+        {
+            name = "非法图标", connectionId = "menu-source", sql = "SELECT OrgId, Amount FROM Orders", orgColumn = "OrgId",
+            icon = "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=", fields = new[] { new { key = "Amount", label = "金额" } }, enabled = true
+        });
+        Assert.Equal(HttpStatusCode.BadRequest, invalidIcon.StatusCode);
+    }
+
+    [Fact]
     public async Task ReportConfigurationSupportsChineseColumnsAndReturnsFieldValidationErrors()
     {
         using var factory = new PlatformFactory(); using var client = Client(factory); await Login(client);
@@ -62,10 +139,10 @@ public sealed class ApiTests
         var invalid = await client.PostAsJsonAsync("/api/admin/reports", draft);
         Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);
         Assert.Contains("第 1 行字段名为空", JsonNode.Parse(await invalid.Content.ReadAsStringAsync())!["error"]!.GetValue<string>());
+        draft.Fields = [new("销售金额", "销售金额")];
         draft.OrgColumn = "";
-        invalid = await client.PostAsJsonAsync("/api/admin/reports", draft);
-        Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);
-        Assert.Contains("请填写组织 ID 字段", JsonNode.Parse(await invalid.Content.ReadAsStringAsync())!["error"]!.GetValue<string>());
+        var withoutOrganizationFilter = await Json(await client.PutAsJsonAsync("/api/admin/reports/" + saved["id"]!.GetValue<string>(), draft));
+        Assert.Equal("", withoutOrganizationFilter["orgColumn"]!.GetValue<string>());
         Assert.Single(store.All<Report>());
     }
 
@@ -115,7 +192,9 @@ public sealed class ApiTests
     {
         using var factory = new PlatformFactory(); using var client = Client(factory);
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/bootstrap")).StatusCode);
-        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsJsonAsync("/api/login", new { username = "admin", password = "wrong" })).StatusCode);
+        var wrongLogin = await client.PostAsJsonAsync("/api/login", new { username = "admin", password = "wrong" });
+        Assert.Equal(HttpStatusCode.Unauthorized, wrongLogin.StatusCode);
+        Assert.Equal("账号或密码错误", JsonNode.Parse(await wrongLogin.Content.ReadAsStringAsync())!["error"]!.GetValue<string>());
         var step = await Json(await client.PostAsJsonAsync("/api/login", new { username = "admin", password = "Integration123!" }));
         Assert.Single(step["accounts"]!.AsArray());
         Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync("/api/login", new { username = "admin", password = "Integration123!", accountId = "foreign" })).StatusCode);
@@ -125,6 +204,16 @@ public sealed class ApiTests
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/bootstrap")).StatusCode);
         client.DefaultRequestHeaders.Remove("X-Requested-With");
         Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync("/api/login", new { username = "admin", password = "Integration123!" })).StatusCode);
+    }
+    [Fact]
+    public async Task PasswordCanBeChangedAndRevokesExistingSession()
+    {
+        using var factory = new PlatformFactory(); using var client = Client(factory); await Login(client);
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.PostAsJsonAsync("/api/password", new { currentPassword = "wrong", newPassword = "NewPassword123!" })).StatusCode);
+        await Json(await client.PostAsJsonAsync("/api/password", new { currentPassword = "Integration123!", newPassword = "abc12" }));
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/bootstrap")).StatusCode);
+        await Login(client, password: "abc12");
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/bootstrap")).StatusCode);
     }
     [Fact]
     public async Task ButtonPermissionsOrganizationScopeExportAndAuditWorkTogether()
@@ -157,16 +246,19 @@ public sealed class ApiTests
         Assert.Equal(HttpStatusCode.Unauthorized, (await reader.GetAsync("/api/bootstrap")).StatusCode);
     }
     [Fact]
-    public async Task QueryAndExportLimitsAreEnforced()
+    public async Task PagingAndUnlimitedExportWork()
     {
         using var factory = new PlatformFactory(); using var client = Client(factory); await Login(client);
         var store = factory.Services.GetRequiredService<PlatformStore>();
         store.Save(new DataSource { Id = "source", Name = "Test" });
         store.Save(new Report { Id = "report", Name = "测试报表", ConnectionId = "source", Enabled = true, Sql = "SELECT OrgId, Amount FROM Orders", OrgColumn = "OrgId", Fields = [new("Amount", "金额")] });
-        factory.Executor.Count = 501;
-        var result = await Json(await client.PostAsJsonAsync("/api/reports/report/query", new { }));
-        Assert.Equal(500, result["rows"]!.AsArray().Count); Assert.True(result["truncated"]!.GetValue<bool>());
-        factory.Executor.Count = 10001;
-        Assert.Equal(HttpStatusCode.BadRequest, (await client.PostAsJsonAsync("/api/reports/report/export", new { })).StatusCode);
+        factory.Executor.Count = 1501;
+        var result = await Json(await client.PostAsJsonAsync("/api/reports/report/query", new { page = 2, pageSize = 500 }));
+        Assert.Equal(500, result["rows"]!.AsArray().Count); Assert.Equal(1501, result["total"]!.GetValue<int>());
+        Assert.Equal(2, result["page"]!.GetValue<int>()); Assert.Equal(500, result["pageSize"]!.GetValue<int>());
+        var export = await client.PostAsJsonAsync("/api/reports/report/export", new { });
+        Assert.True(export.IsSuccessStatusCode);
+        var csv = await export.Content.ReadAsStringAsync();
+        Assert.Contains("金额", csv); Assert.Contains("1600", csv);
     }
 }
